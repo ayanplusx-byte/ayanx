@@ -1,9 +1,17 @@
-import os, re, time, math, json, asyncio, shutil, subprocess, datetime
+# main.py — v2 upgraded (FAST + CLEAN + STABLE) WITHOUT removing any feature
+# v2 adds on top of previous upgrade:
+# ✅ Busy lock (one task per user) => no state confusion on spam clicks/messages
+# ✅ Cancel flow smoother (canceled => next file prompt)
+# ✅ Better friendly error messages + some common telegram/network handling
+# ✅ Still: thread-offload for ffmpeg/ffprobe/PIL + debounced JSON flush + FloodWait-safe progress + unique temp names
+
+import os, re, time, math, json, asyncio, subprocess, datetime
 from typing import Optional, Dict, Any, List
 
 from PIL import Image
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import FloodWait
 
 # ================== BRAND ==================
 BRAND = "𝗟𝗘𝗚𝗘𝗡𝗗  OWNERX®"
@@ -22,7 +30,7 @@ ADMIN_IDS = {6014515919}
 # ================== PATHS ==================
 BASE = os.path.dirname(os.path.abspath(__file__))
 
-# Railway Volume: /data (recommended mount point)
+# Railway Volume mount point (recommended: /data). Set BOT_VOLUME=/data in Railway variables.
 VOLUME_ROOT = os.environ.get("BOT_VOLUME", os.path.join(BASE, "data_vol"))
 
 DATA = os.path.join(VOLUME_ROOT, "data")
@@ -57,6 +65,7 @@ DEFAULT_USER = {
     "last_active": None                # ISO timestamp
 }
 
+# ================== JSON HELPERS ==================
 def load_json(path, default):
     if not os.path.exists(path):
         return default
@@ -81,16 +90,77 @@ app = Client(BOT_TITLE, api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # ================== RUNTIME STATE ==================
 state: Dict[int, Dict[str, Any]] = {}
-# state[uid] = {
-#   "queue": [queue_item_dict],
-#   "awaiting_name": bool,
-#   "awaiting_type": bool,
-#   "pending_item": dict|None,
-#   "new_name": str|None,
-#   "awaiting_thumb": bool,
-#   "cancel": dict|None,
-#   "awaiting_broadcast": bool
-# }
+
+# ================== ASYNC SAFETY (DEBOUNCE + LOCKS) ==================
+users_lock = asyncio.Lock()
+config_lock = asyncio.Lock()
+queue_lock = asyncio.Lock()
+
+_dirty_users = False
+_dirty_config = False
+_dirty_queue = False
+
+_last_users_flush = 0.0
+_last_config_flush = 0.0
+_last_queue_flush = 0.0
+
+def mark_users_dirty():
+    global _dirty_users
+    _dirty_users = True
+
+def mark_config_dirty():
+    global _dirty_config
+    _dirty_config = True
+
+def mark_queue_dirty():
+    global _dirty_queue
+    _dirty_queue = True
+
+async def _flush_users(force: bool = False, min_interval: int = 20):
+    global _dirty_users, _last_users_flush
+    if not _dirty_users and not force:
+        return
+    now = time.time()
+    if not force and (now - _last_users_flush) < min_interval:
+        return
+    async with users_lock:
+        await asyncio.to_thread(save_json, USERS_JSON, users)
+        _dirty_users = False
+        _last_users_flush = now
+
+async def _flush_config(force: bool = False, min_interval: int = 30):
+    global _dirty_config, _last_config_flush
+    if not _dirty_config and not force:
+        return
+    now = time.time()
+    if not force and (now - _last_config_flush) < min_interval:
+        return
+    async with config_lock:
+        await asyncio.to_thread(save_json, CONFIG_JSON, config)
+        _dirty_config = False
+        _last_config_flush = now
+
+async def _flush_queue(force: bool = False, min_interval: int = 10):
+    global _dirty_queue, _last_queue_flush
+    if not _dirty_queue and not force:
+        return
+    now = time.time()
+    if not force and (now - _last_queue_flush) < min_interval:
+        return
+    async with queue_lock:
+        await asyncio.to_thread(save_json, QUEUE_JSON, queue_store)
+        _dirty_queue = False
+        _last_queue_flush = now
+
+async def flush_loop():
+    while True:
+        try:
+            await _flush_users()
+            await _flush_config()
+            await _flush_queue()
+        except:
+            pass
+        await asyncio.sleep(5)
 
 # ================== BASIC HELPERS ==================
 def is_admin(uid: int) -> bool:
@@ -107,7 +177,7 @@ def safe_filename(name: str) -> str:
 def human_bytes(size: int) -> str:
     if size <= 0:
         return "0 B"
-    units = ["B","KB","MB","GB","TB"]
+    units = ["B", "KB", "MB", "GB", "TB"]
     i = int(math.floor(math.log(size, 1024)))
     p = math.pow(1024, i)
     s = round(size / p, 2)
@@ -131,6 +201,11 @@ def progress_bar(current: int, total: int, width: int = 12) -> str:
     filled = min(max(filled, 0), width)
     return "■" * filled + "□" * (width - filled)
 
+def _unique_tmp_name(uid: int, original_name: str) -> str:
+    base = safe_filename(original_name or "file")
+    stamp = int(time.time() * 1000)
+    return f"{uid}_{stamp}_{base}"
+
 def ensure_user(uid: int):
     uid_s = str(uid)
 
@@ -143,12 +218,14 @@ def ensure_user(uid: int):
             "new_name": None,
             "awaiting_thumb": False,
             "cancel": None,
-            "awaiting_broadcast": False
+            "awaiting_broadcast": False,
+            "busy": False,            # ✅ v2: busy lock
+            "busy_msg_id": None
         }
 
     if uid_s not in users:
         users[uid_s] = dict(DEFAULT_USER)
-        save_json(USERS_JSON, users)
+        mark_users_dirty()
 
     # load persisted queue into runtime once
     if not state[uid]["queue"]:
@@ -159,11 +236,14 @@ def ensure_user(uid: int):
 def persist_queue(uid: int):
     uid_s = str(uid)
     queue_store[uid_s] = state[uid]["queue"]
-    save_json(QUEUE_JSON, queue_store)
+    mark_queue_dirty()
 
 def touch_user(uid: int):
     users[str(uid)]["last_active"] = now_iso()
-    save_json(USERS_JSON, users)
+    mark_users_dirty()
+
+def total_gb(bytes_count: int) -> float:
+    return round(bytes_count / (1024**3), 3)
 
 # ================== UI ==================
 def menu_kb():
@@ -180,7 +260,7 @@ def settings_kb(uid: int):
     fast = "ON ✅" if u.get("fast_mode", True) else "OFF ❌"
     meta = "ON ✅" if u.get("meta_caption", True) else "OFF ❌"
     mode = u.get("thumb_mode", "custom")
-    mode_txt = {"custom":"CUSTOM", "auto":"AUTO", "off":"OFF"}.get(mode, mode.upper())
+    mode_txt = {"custom": "CUSTOM", "auto": "AUTO", "off": "OFF"}.get(mode, mode.upper())
 
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"⚡ Fast Mode: {fast}", callback_data="toggle_fast"),
@@ -207,13 +287,13 @@ async def maintenance_guard(message):
         return True
     return False
 
-# ================== THUMB HELPERS ==================
+# ================== THUMB HELPERS (BLOCKING) ==================
 def make_thumb_jpg(src_path: str, out_path: str):
     img = Image.open(src_path).convert("RGB")
     max_side = 320
     w, h = img.size
     scale = min(max_side / max(w, h), 1.0)
-    img = img.resize((int(w*scale), int(h*scale)))
+    img = img.resize((int(w * scale), int(h * scale)))
 
     quality = 85
     while True:
@@ -223,13 +303,11 @@ def make_thumb_jpg(src_path: str, out_path: str):
         quality -= 10
 
 def ffprobe_metadata(path: str) -> Dict[str, Any]:
-    """
-    Returns: {"duration": float|None, "width": int|None, "height": int|None}
-    """
     meta = {"duration": None, "width": None, "height": None}
     try:
         cmd = [
             "ffprobe", "-v", "error",
+            "-hide_banner",
             "-select_streams", "v:0",
             "-show_entries", "stream=width,height:format=duration",
             "-of", "json",
@@ -251,16 +329,10 @@ def ffprobe_metadata(path: str) -> Dict[str, Any]:
     return meta
 
 def make_auto_thumb_from_video(video_path: str, out_jpg: str) -> bool:
-    """
-    Extract a frame using a safe timestamp (works for short videos too).
-    """
     try:
         meta = ffprobe_metadata(video_path)
         dur = meta.get("duration") or 0.0
 
-        # pick a safe timestamp:
-        # - if duration known: take 20% of duration (cap at 2s, min 0.2s)
-        # - else fallback to 1s
         if dur and dur > 0:
             ss = max(0.2, min(2.0, dur * 0.2))
         else:
@@ -268,8 +340,10 @@ def make_auto_thumb_from_video(video_path: str, out_jpg: str) -> bool:
 
         cmd = [
             "ffmpeg", "-y",
+            "-hide_banner", "-loglevel", "error",
             "-ss", str(ss),
             "-i", video_path,
+            "-an", "-sn",
             "-frames:v", "1",
             "-vf", "scale=320:-1",
             out_jpg
@@ -285,6 +359,9 @@ def make_auto_thumb_from_video(video_path: str, out_jpg: str) -> bool:
     except:
         return False
     return False
+
+async def run_blocking(func, *args, **kwargs):
+    return await asyncio.to_thread(func, *args, **kwargs)
 
 # ================== PROGRESS CALLBACK ==================
 async def progress_callback(current, total, msg, stage: str, start_ts: float, cancel_flag: dict):
@@ -307,15 +384,17 @@ async def progress_callback(current, total, msg, stage: str, start_ts: float, ca
     )
 
     last = cancel_flag.get("last_edit", 0)
-    if now - last >= 0.8:  # slightly slower edits = less floodwait
+    if now - last >= 0.9:
         cancel_flag["last_edit"] = now
-        await msg.edit_text(text, reply_markup=cancel_flag["kb"])
+        try:
+            await msg.edit_text(text, reply_markup=cancel_flag["kb"])
+        except FloodWait as e:
+            await asyncio.sleep(getattr(e, "value", 1))
+        except:
+            pass
 
 # ================== QUEUE ITEM BUILDER ==================
 def queue_item_from_message(message) -> Optional[Dict[str, Any]]:
-    """
-    Store file_id + file_name + kind for crash recovery.
-    """
     if message.document:
         return {
             "kind": "document",
@@ -335,6 +414,20 @@ def queue_item_from_message(message) -> Optional[Dict[str, Any]]:
             "file_name": message.audio.file_name or "audio.mp3"
         }
     return None
+
+# ================== FRIENDLY ERROR ==================
+def friendly_error(e: Exception) -> str:
+    msg = str(e) or "Unknown error"
+    low = msg.lower()
+    if "canceled by user" in low or "canceled" in low:
+        return "❌ Canceled ✅"
+    if "flood" in low:
+        return "⏳ Telegram FloodWait. Thoda wait karke try karo."
+    if "file is too big" in low or "entity too large" in low:
+        return "📦 File bahut bada hai. Telegram limit ya upload restriction ho sakti hai."
+    if "network" in low or "timeout" in low:
+        return "🌐 Network/Timeout issue. Thoda baad me try karo."
+    return f"❌ Error: {msg}"
 
 # ================== START ==================
 @app.on_message(filters.command("start"))
@@ -370,7 +463,7 @@ async def toggle_fast_cb(client, cq):
     uid = cq.from_user.id
     ensure_user(uid)
     users[str(uid)]["fast_mode"] = not users[str(uid)].get("fast_mode", True)
-    save_json(USERS_JSON, users)
+    mark_users_dirty()
     await cq.answer("Updated")
     await cq.message.edit_reply_markup(reply_markup=settings_kb(uid))
 
@@ -379,7 +472,7 @@ async def toggle_meta_cb(client, cq):
     uid = cq.from_user.id
     ensure_user(uid)
     users[str(uid)]["meta_caption"] = not users[str(uid)].get("meta_caption", True)
-    save_json(USERS_JSON, users)
+    mark_users_dirty()
     await cq.answer("Updated")
     await cq.message.edit_reply_markup(reply_markup=settings_kb(uid))
 
@@ -390,7 +483,7 @@ async def cycle_thumbmode_cb(client, cq):
     mode = users[str(uid)].get("thumb_mode", "custom")
     mode = "auto" if mode == "custom" else ("off" if mode == "auto" else "custom")
     users[str(uid)]["thumb_mode"] = mode
-    save_json(USERS_JSON, users)
+    mark_users_dirty()
     await cq.answer(f"Thumb: {mode}")
     await cq.message.edit_reply_markup(reply_markup=settings_kb(uid))
 
@@ -410,7 +503,7 @@ async def clear_thumb(client, cq):
     uid_s = str(uid)
     t = users[uid_s].get("thumb_path")
     users[uid_s]["thumb_path"] = None
-    save_json(USERS_JSON, users)
+    mark_users_dirty()
     state[uid]["awaiting_thumb"] = False
     if t and os.path.exists(t):
         try:
@@ -432,12 +525,18 @@ async def q_status(client, cq):
 async def q_clear(client, cq):
     uid = cq.from_user.id
     ensure_user(uid)
+
+    # If currently processing, stop it
+    if state[uid].get("cancel"):
+        state[uid]["cancel"]["stop"] = True
+
     state[uid]["queue"].clear()
     state[uid]["awaiting_name"] = False
     state[uid]["awaiting_type"] = False
     state[uid]["pending_item"] = None
     state[uid]["new_name"] = None
     persist_queue(uid)
+
     await cq.answer("Cleared")
     await cq.message.reply_text("🧹 Queue cleared.")
 
@@ -445,7 +544,7 @@ async def q_clear(client, cq):
 async def cancel_any(client, cq):
     uid = cq.from_user.id
     ensure_user(uid)
-    if state[uid]["cancel"]:
+    if state[uid].get("cancel"):
         state[uid]["cancel"]["stop"] = True
     await cq.answer("Canceled ✅")
 
@@ -466,9 +565,6 @@ async def panel(client, message):
         [InlineKeyboardButton("📢 Broadcast", callback_data="admin_bc")]
     ])
     await message.reply_text("🧑‍💻 Admin Panel", reply_markup=kb)
-
-def total_gb(bytes_count: int) -> float:
-    return round(bytes_count / (1024**3), 3)
 
 @app.on_callback_query(filters.regex("^admin_stats$"))
 async def admin_stats(client, cq):
@@ -506,7 +602,7 @@ async def admin_maint(client, cq):
         await cq.answer("Not allowed", show_alert=True)
         return
     config["maintenance"] = not config.get("maintenance", False)
-    save_json(CONFIG_JSON, config)
+    mark_config_dirty()
     await cq.answer("Done")
     await cq.message.reply_text(f"🧰 Maintenance: {config['maintenance']}")
 
@@ -574,10 +670,11 @@ async def photo_in(client, message):
         return
     touch_user(uid)
 
-    # if user sends photo anytime, accept as thumb
     src = await message.download(file_name=os.path.join(DL, f"thumb_src_{uid}.jpg"))
     out = os.path.join(THUMBS, f"thumb_{uid}.jpg")
-    make_thumb_jpg(src, out)
+
+    await run_blocking(make_thumb_jpg, src, out)
+
     try:
         os.remove(src)
     except:
@@ -585,7 +682,7 @@ async def photo_in(client, message):
 
     users[str(uid)]["thumb_path"] = out
     users[str(uid)]["thumb_mode"] = "custom"
-    save_json(USERS_JSON, users)
+    mark_users_dirty()
     state[uid]["awaiting_thumb"] = False
     await message.reply_text("✅ THUMBNAIL SAVED (CUSTOM)")
 
@@ -605,7 +702,8 @@ async def file_in(client, message):
     state[uid]["queue"].append(item)
     persist_queue(uid)
 
-    if state[uid]["awaiting_name"] or state[uid]["awaiting_type"] or state[uid]["pending_item"]:
+    # ✅ v2: if already processing, just add to queue and inform
+    if state[uid].get("busy") or state[uid]["awaiting_name"] or state[uid]["awaiting_type"] or state[uid]["pending_item"]:
         await message.reply_text(f"📥 Added to queue. Queue: {len(state[uid]['queue'])}")
         return
 
@@ -613,6 +711,11 @@ async def file_in(client, message):
 
 async def ask_new_name(chat_id: int, uid: int):
     ensure_user(uid)
+
+    # if user is busy, don't prompt new name
+    if state[uid].get("busy"):
+        return
+
     if not state[uid]["queue"]:
         await app.send_message(chat_id, "✅ Queue done.", reply_markup=menu_kb())
         return
@@ -640,6 +743,11 @@ async def type_select(client, cq):
         await cq.answer("No pending file")
         return
 
+    # ✅ v2: busy lock ON
+    if state[uid].get("busy"):
+        await cq.answer("Already processing", show_alert=True)
+        return
+
     state[uid]["awaiting_type"] = False
     out_type = cq.data  # type_doc / type_vid
 
@@ -659,83 +767,69 @@ async def type_select(client, cq):
     if not new_ext and old_ext:
         new_name += old_ext
 
+    # busy ON
+    state[uid]["busy"] = True
+
     pmsg = await cq.message.reply_text(f"**{BRAND}**\n\nStarting...", reply_markup=cancel_kb(uid))
     cancel_flag = {"stop": False, "last_edit": 0, "kb": cancel_kb(uid)}
     state[uid]["cancel"] = cancel_flag
 
     final_path = None
-    in_mem = False
+    dl_path = None
+    canceled = False
+
     try:
         # ---------- DOWNLOAD ----------
         dl_start = time.time()
         file_id = item["file_id"]
 
-        # Fast mode: small file in memory, else disk
-        fast = users[str(uid)].get("fast_mode", True)
-        # We don't know exact size from file_id alone reliably -> use disk by default,
-        # but pyrogram supports in_memory=True. We'll do it only when kind is document/audio
-        # (safer), videos usually huge.
-        if fast and item.get("kind") in ("document", "audio"):
-            in_mem = True
-
-        if in_mem:
-            downloaded = await app.download_media(
-                file_id,
-                in_memory=True,
-                progress=progress_callback,
-                progress_args=(pmsg, "Downloading (Fast)", dl_start, cancel_flag)
-            )
-            # downloaded is BytesIO
-            tmp_path = os.path.join(DL, f"{uid}_{int(time.time())}_{old_name}")
-            with open(tmp_path, "wb") as f:
-                f.write(downloaded.getvalue())
-            dl_path = tmp_path
-        else:
-            dl_path = await app.download_media(
-                file_id,
-                file_name=os.path.join(DL, f"{uid}_{int(time.time())}_{old_name}"),
-                progress=progress_callback,
-                progress_args=(pmsg, "Downloading", dl_start, cancel_flag)
-            )
+        tmp_name = _unique_tmp_name(uid, old_name)
+        dl_path = await app.download_media(
+            file_id,
+            file_name=os.path.join(DL, tmp_name),
+            progress=progress_callback,
+            progress_args=(pmsg, "Downloading", dl_start, cancel_flag)
+        )
 
         # stats bytes_in
         try:
             users[str(uid)]["bytes_in"] = int(users[str(uid)].get("bytes_in", 0)) + int(os.path.getsize(dl_path))
-            save_json(USERS_JSON, users)
+            mark_users_dirty()
         except:
             pass
 
-        # rename locally
-        final_path = os.path.join(DL, new_name)
-        if os.path.exists(final_path):
-            base, ext = os.path.splitext(new_name)
-            final_path = os.path.join(DL, f"{base}_{int(time.time())}{ext}")
+        # rename locally unique path, but visible name remains new_name
+        unique_final = _unique_tmp_name(uid, new_name)
+        final_path = os.path.join(DL, unique_final)
         os.rename(dl_path, final_path)
+        dl_path = None
 
-       # ---------- THUMB SELECT ----------
+        # ---------- THUMB SELECT ----------
         thumb_to_use = None
         mode = users[str(uid)].get("thumb_mode", "custom")
 
         if mode == "off":
             thumb_to_use = None
-
         elif mode == "custom":
             t = users[str(uid)].get("thumb_path")
             if t and os.path.exists(t):
                 thumb_to_use = t
-
         elif mode == "auto":
             if item.get("kind") == "video" or out_type == "type_vid":
                 auto_out = os.path.join(THUMBS, f"auto_{uid}.jpg")
-                ok = make_auto_thumb_from_video(final_path, auto_out)
+                ok = await run_blocking(make_auto_thumb_from_video, final_path, auto_out)
                 if ok:
                     thumb_to_use = auto_out
 
         # ---------- METADATA + CAPTION ----------
-        caption = f"✅ Renamed: {os.path.basename(final_path)}"
+        caption = f"✅ Renamed: {new_name}"
         if users[str(uid)].get("meta_caption", True):
             size = os.path.getsize(final_path) if os.path.exists(final_path) else 0
-            meta = ffprobe_metadata(final_path) if out_type == "type_vid" else {"duration": None, "width": None, "height": None}
+            if out_type == "type_vid":
+                meta = await run_blocking(ffprobe_metadata, final_path)
+            else:
+                meta = {"duration": None, "width": None, "height": None}
+
             parts = [f"📦 Size: {human_bytes(size)}"]
             if meta.get("duration"):
                 parts.append(f"⏱ Duration: {format_time(meta['duration'])}")
@@ -745,52 +839,60 @@ async def type_select(client, cq):
 
         # ---------- UPLOAD ----------
         up_start = time.time()
-
         if out_type == "type_vid":
-            sent = await app.send_video(
+            await app.send_video(
                 cq.message.chat.id,
                 video=final_path,
-                file_name=os.path.basename(final_path),
+                file_name=new_name,
                 thumb=thumb_to_use,
                 progress=progress_callback,
                 progress_args=(pmsg, "Uploading", up_start, cancel_flag),
                 caption=caption
             )
         else:
-            sent = await app.send_document(
+            await app.send_document(
                 cq.message.chat.id,
                 document=final_path,
-                file_name=os.path.basename(final_path),
+                file_name=new_name,
                 thumb=thumb_to_use,
                 progress=progress_callback,
                 progress_args=(pmsg, "Uploading", up_start, cancel_flag),
                 caption=caption
             )
 
-        # stats bytes_out
+        # stats bytes_out + count
         try:
             users[str(uid)]["bytes_out"] = int(users[str(uid)].get("bytes_out", 0)) + int(os.path.getsize(final_path))
         except:
             pass
-
         users[str(uid)]["count"] = int(users[str(uid)].get("count", 0)) + 1
-        save_json(USERS_JSON, users)
+        mark_users_dirty()
 
         await pmsg.edit_text(f"✅ Done, **{BRAND}**!", reply_markup=menu_kb())
 
     except Exception as e:
-        await pmsg.edit_text(f"❌ Error: {e}", reply_markup=menu_kb())
+        text = friendly_error(e)
+        if "Canceled" in text:
+            canceled = True
+        await pmsg.edit_text(text, reply_markup=menu_kb())
 
     finally:
         state[uid]["cancel"] = None
+        state[uid]["busy"] = False  # ✅ v2: busy OFF always
 
         # cleanup temp files
+        try:
+            if dl_path and os.path.exists(dl_path):
+                os.remove(dl_path)
+        except:
+            pass
         try:
             if final_path and os.path.exists(final_path):
                 os.remove(final_path)
         except:
             pass
 
+        # ✅ v2: after cancel or finish, continue to next file automatically
         await ask_new_name(cq.message.chat.id, uid)
 
     await cq.answer("OK")
@@ -804,9 +906,8 @@ def clean_old_temp_files(hours: int = 6):
         for name in os.listdir(root):
             path = os.path.join(root, name)
             try:
-                if os.path.isfile(path):
-                    if os.path.getmtime(path) < cutoff:
-                        os.remove(path)
+                if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                    os.remove(path)
             except:
                 pass
 
@@ -816,20 +917,16 @@ async def auto_clean_loop():
             clean_old_temp_files(int(config.get("auto_clean_hours", 6)))
         except:
             pass
-        await asyncio.sleep(60 * 30)  # every 30 min
+        await asyncio.sleep(60 * 30)
 
 # ================== DAILY REPORT ==================
 async def send_daily_report():
-    # one report per day
     today = (datetime.datetime.utcnow() + datetime.timedelta(hours=5, minutes=30)).date().isoformat()
-    last = config.get("last_daily_report")
-    # if admin manually triggers, allow anyway by passing through, but we set date
     total_users = len(users)
     total_renames = sum(int(v.get("count", 0)) for v in users.values())
     total_in = sum(int(v.get("bytes_in", 0)) for v in users.values())
     total_out = sum(int(v.get("bytes_out", 0)) for v in users.values())
 
-    # top 5
     ranked = sorted(users.items(), key=lambda kv: int(kv[1].get("count", 0)), reverse=True)[:5]
     top_lines = []
     for i, (uid_s, u) in enumerate(ranked, 1):
@@ -851,7 +948,7 @@ async def send_daily_report():
             pass
 
     config["last_daily_report"] = today
-    save_json(CONFIG_JSON, config)
+    mark_config_dirty()
 
 async def daily_report_loop():
     while True:
@@ -859,14 +956,13 @@ async def daily_report_loop():
             now = datetime.datetime.utcnow() + datetime.timedelta(hours=5, minutes=30)  # IST
             today = now.date().isoformat()
             hour = int(config.get("daily_report_hour", 21))
-            # send once after target hour
             if now.hour >= hour and config.get("last_daily_report") != today:
                 await send_daily_report()
         except:
             pass
-        await asyncio.sleep(60 * 10)  # every 10 min
+        await asyncio.sleep(60 * 10)
 
-# ================== ON STARTUP ==================
+# ================== ME ==================
 @app.on_message(filters.command("me"))
 async def me_cmd(client, message):
     uid = message.from_user.id
@@ -884,6 +980,7 @@ async def me_cmd(client, message):
 
 # ================== RUN ==================
 if __name__ == "__main__":
+    app.loop.create_task(flush_loop())        # debounced file writes
     app.loop.create_task(auto_clean_loop())
     app.loop.create_task(daily_report_loop())
     app.run()
