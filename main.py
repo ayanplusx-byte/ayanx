@@ -7,7 +7,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait
 
 # ================== VERSION ==================
-BOT_VERSION = "v4.0.0-fast"
+BOT_VERSION = "v4.1.0-fast"
 
 # ================== BRAND ==================
 BRAND = "𝗟𝗘𝗚𝗘𝗡𝗗  OWNERX®"
@@ -162,11 +162,17 @@ def queue_item_from_message(message) -> Optional[Dict[str, Any]]:
 async def start_cmd(client, message):
     uid = message.from_user.id
     ensure(uid)
+
     await message.reply_text(
-        f"✅ Welcome **{BRAND}**\nVersion: `{BOT_VERSION}`\n\n"
-        "• Thumbnail set: send photo anytime\n"
-        "• Send **one file** → I will ask new name → choose type → done\n\n"
-        "⚡ This build has NO queue, NO coupons (fastest).",
+        "🚀 𝗪𝗘𝗟𝗖𝗢𝗠𝗘 𝗧𝗢 𝗟𝗘𝗚𝗘𝗡𝗗𝗫 𝗥𝗘𝗡𝗔𝗠𝗘𝗥 𝗕𝗢𝗧\n\n"
+        "⚡ The Fastest Telegram File Renamer\n\n"
+        "📌 How To Use\n\n"
+        "1️⃣ Send any file\n"
+        "2️⃣ Enter new filename\n"
+        "3️⃣ Select output type\n"
+        "4️⃣ Get renamed file instantly\n\n"
+        "🖼 Send a photo to set custom thumbnail\n\n"
+        "⚡ Send only one file at a time for fastest processing",
         reply_markup=menu_kb()
     )
 
