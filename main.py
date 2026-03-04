@@ -57,6 +57,11 @@ def safe_filename(name: str) -> str:
     name = (name or "").strip()
     name = re.sub(r"[\\/:*?\"<>|]", "_", name)
     return name[:120] if len(name) > 120 else name
+    
+def _unique_tmp_name(uid: int, original_name: str) -> str:
+    base = safe_filename(original_name or "file")
+    stamp = int(time.time() * 1000)
+    return f"{uid}_{stamp}_{base}"
 
 def human_bytes(size: int) -> str:
     if size <= 0:
